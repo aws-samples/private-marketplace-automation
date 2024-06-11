@@ -1,0 +1,342 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template creates and manages private marketplace experiences from configuration files in Amazon S3
+Parameters:
+  ExperiencesS3BucketName: 
+    Type: String
+    Description: Amazon S3 bucket that holds the configuration for private marketplace experiences
+Resources:
+  ConfigurePrivateMarketplaceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lambda execution role for enabling service access for AWS Organization
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                  - S3:GetObject
+                  - S3:PutObject
+                  - S3:ListObjects
+                Effect: Allow
+                Resource:
+                    - !Sub arn:aws:s3:::${ExperiencesS3BucketName}
+                    - !Sub arn:aws:s3:::${ExperiencesS3BucketName}/*
+            Version: '2012-10-17'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - PMPS3EnablementLambdas3Policy
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - aws-marketplace:StartChangeSet
+                  - aws-marketplace:DescribeChangeSet
+                Effect: Allow
+                Resource: '*'
+            Version: '2012-10-17'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - PMPMPEnablementLambdampPolicy
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  AsyncConfigurePrivateMarketplaceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 'ConfigurePrivateMarketplaceLambdaRole.Arn'
+      Timeout: 900
+      ReservedConcurrentExecutions: 3
+      Code:
+        ZipFile: |
+          import sys
+          import os
+          import time
+          import json
+          import boto3
+          import urllib.parse
+
+          REGION = 'us-east-1'
+          MARKETPLACE_CATALOG = 'AWSMarketplace'
+          PMP_S3_BUCKET = os.environ['PMP_S3_BUCKET']
+          EXPERIENCE_FILE_NAME_CHAR = '#'
+          PMP_STATUS_FILE_PREFIX = 'STATUS_'
+          CHANGESET_ID= 'ChangeSetId'
+          EXPERIENCE_ID = "Experience Id"
+          CHANGESET_IN_PROGRESS = 'In Progress'
+          CHANGESET_STATUS = 'ChangeSetStatus'
+          ERROR_MESSAGE = 'Error Message'
+
+          EXPERIENCE_NAME = "Name"
+          EXPERIENCE_ASSOCIATE_PRINCIPALS = "AssociatePrincipals"
+          EXPERIENCE_DISASSOCIATE_PRINCIPALS = "DisassociatePrincipals"
+          EXPERIENCE_ALLOW_PRODUCTS = "AllowProducts"
+          EXPERIENCE_DENY_PRODUCTS = "DenyProducts"
+          EXPERIENCE_STATUS = "Status"
+          EXPERIENCE_POLICY_RESOURCE_REQUESTS = "PolicyResourceRequests"
+          EXPERIENCE_CREATION_ENTITY_ID = "$ExperienceCreationChange.Entity.Identifier"
+
+          s3_client = boto3.client('s3')
+          mp_client = boto3.client('marketplace-catalog', region_name = REGION)
+
+          def lambda_handler(event, context):
+              try:
+                  print("Entering AsyncConfigurePrivateMarketplaceLambda handler")
+
+                  # Check if event contains Records
+                  if not event.get('Records'):
+                      print("Empty event received. Exit!")
+                      return
+
+                  # Get the s3 file that was uploaded  
+                  if not event['Records'][0].get('s3'):
+                      print("Event does not have s3 details. Exit!")
+                      return
+
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+                  print("Reading configuration details from s3 bucket:", bucket + " s3 file:", key)    
+                
+                  experience_content = s3_client.get_object(
+                      Bucket = bucket,
+                      Key = key)['Body'].read()
+                  details = json.loads(experience_content)
+                  print('Configuration details:', details)
+
+                  # Status file name is status_<experience_file_prefix>
+                  experience_file_prefix = key.split(EXPERIENCE_FILE_NAME_CHAR)[0]
+                  s3_status_file_name = PMP_STATUS_FILE_PREFIX + experience_file_prefix
+                  print("Status file:" +s3_status_file_name)
+                  
+                  status_content = '{}'
+                  try:
+                      status_content = s3_client.get_object(
+                        Bucket = PMP_S3_BUCKET,
+                        Key = s3_status_file_name)['Body'].read()
+                  except s3_client.exceptions.NoSuchKey:
+                      print("Status file does not exist")
+                      json.loads(status_content)
+                  status_details = json.loads(status_content)
+
+                  # Do not invoke changeset if its already in progress
+                  if CHANGESET_STATUS in status_details and status_details[CHANGESET_STATUS] == CHANGESET_IN_PROGRESS: 
+                      print("Changeset status is in progress. Throw an error ")
+                      raise Exception("The changeset is already in progress for  " + PMP_S3_FILE + ". You can rerun this once status is successful.")
+
+                  # Create or manage based on whether the experience has been created already
+                  if EXPERIENCE_ID in status_details:
+                      manage_private_marketplace(details, status_details, s3_status_file_name)
+                  else: 
+                      create_private_marketplace(details, status_details, s3_status_file_name)
+              except Exception as e:
+                  print("ERROR: Lambda failed with an exception", e)
+
+          def build_change_set_list(details, status_details, entity_id):
+              changeset_list = []
+              if(entity_id == EXPERIENCE_CREATION_ENTITY_ID):
+                  build_and_append_create_changesets(changeset_list, details, entity_id)
+              build_and_append_audience_changeset(changeset_list, details, 'AssociateAudience', EXPERIENCE_ASSOCIATE_PRINCIPALS, entity_id)
+              build_and_append_audience_changeset(changeset_list, details, 'DisassociateAudience', EXPERIENCE_DISASSOCIATE_PRINCIPALS, entity_id)
+              build_and_append_product_procurement_changeset(changeset_list, details, 'AllowProductProcurement', EXPERIENCE_ALLOW_PRODUCTS, entity_id)
+              build_and_append_product_procurement_changeset(changeset_list, details, 'DenyProductProcurement', EXPERIENCE_DENY_PRODUCTS, entity_id)
+              build_and_append_status_update_changeset(changeset_list, details, 'UpdateExperience', EXPERIENCE_STATUS, entity_id)
+              build_and_append_requests_update_changeset(changeset_list, details, 'UpdateProcurementPolicy', EXPERIENCE_POLICY_RESOURCE_REQUESTS, entity_id)
+              return changeset_list    
+
+          def manage_private_marketplace(details, status_details, s3_file):
+              print("Updating private marketplace experience", details[EXPERIENCE_NAME])
+              entity_id =  status_details[EXPERIENCE_ID]
+              changeset_list = build_change_set_list(details, status_details, entity_id)
+              
+              response = mp_client.start_change_set(
+                  Catalog=MARKETPLACE_CATALOG,
+                  ChangeSet=changeset_list,
+                  ChangeSetName='Private Marketplace Automation Update Experience  ' + details[EXPERIENCE_NAME]
+              )
+              
+              print("Successfully invoked experience management")
+              write_status_to_s3(response, status_details, s3_file)
+  
+          def create_private_marketplace(details, status_details, s3_file):
+              if not details.get(EXPERIENCE_NAME):
+                  raise Exception("Cannot create Experience without specifying a name")
+          
+              print("Creating and configuring private marketplace experience", details[EXPERIENCE_NAME])
+              entity_id = EXPERIENCE_CREATION_ENTITY_ID
+              changeset_list = build_change_set_list(details, status_details, entity_id)
+
+              response = mp_client.start_change_set(
+                  Catalog=MARKETPLACE_CATALOG,
+                  ChangeSet=changeset_list,
+                  ChangeSetName='Private Marketplace Automation Create Experience ' + details[EXPERIENCE_NAME]
+              )
+              
+              print("Successfully invoked experience creation")
+              write_status_to_s3(response, status_details, s3_file)
+
+          def write_status_to_s3(response, status_details, s3_file):
+              change_set_id = response['ChangeSetId']
+              print("ChangeSet " + change_set_id + " created")   
+              # Write Changeset status to in progress in a status file in S3 bucket
+              changeset_id_json = {CHANGESET_ID: change_set_id}
+              status_details.update(changeset_id_json)
+              changeset_status_update = {CHANGESET_STATUS: CHANGESET_IN_PROGRESS}
+              status_details.update(changeset_status_update)
+
+              # Clear any error messages from previous run
+              if ERROR_MESSAGE in status_details:
+                  status_details.pop(ERROR_MESSAGE)
+              
+              print("Updated details to be written are ", status_details)
+
+              s3_client.put_object(
+                  Bucket=PMP_S3_BUCKET,
+                  Key=s3_file,
+                  Body=json.dumps(status_details).encode()
+              )
+              print('Updated changeset ID', change_set_id, 'in s3 file', s3_file)
+
+          def build_and_append_create_changesets(changeset_list, details, entity_id):
+              # CreateExperience
+              changeset_list.append({
+                  'ChangeType': 'CreateExperience',
+                  'Entity': {
+                      'Type': 'Experience@1.0',
+                  },
+                  "Details": json.dumps({
+                      'Name': details[EXPERIENCE_NAME],
+                      'Description': 'Private Marketplace Experience created from PMP Automation: ' + details[EXPERIENCE_NAME],
+                  }),
+                  'ChangeName': 'ExperienceCreationChange'
+              })
+              
+              # CreateProcurementPolicy
+              changeset_list.append({
+                      'ChangeType': 'CreateProcurementPolicy',
+                      'Details': json.dumps({
+                          'Name': 'Procurement policy for default experience'
+                      }),
+                      "Entity": {
+                          "Type": "Experience@1.0",
+                          "Identifier": entity_id
+                      },
+                      'ChangeName': 'CreateProcurementPolicyChange'
+                  })
+
+          def build_and_append_audience_changeset(changeset_list, details, changeset_name, details_field, entity_id):
+              if details.get(details_field):
+                  changeset_list.append({
+                      'ChangeType': changeset_name,
+                      'Details': json.dumps({
+                          'Principals': details[details_field]
+                      }),
+                      "Entity": {
+                          "Type": "Experience@1.0",
+                          "Identifier": entity_id
+                      },
+                      'ChangeName': changeset_name + 'Change'
+                  })
+
+          def build_and_append_product_procurement_changeset(changeset_list, details, changeset_name, details_field, entity_id):
+              if details.get(details_field):
+                  changeset_list.append({
+                      'ChangeType': changeset_name,
+                      'Details': json.dumps({
+                          'Products': [
+                              {'Ids': details[details_field]}
+                          ]
+                      }),
+                      "Entity": {
+                          "Type": "Experience@1.0",
+                          "Identifier": entity_id
+                      },
+                      'ChangeName': changeset_name + 'Change'
+                  })  
+
+          def build_and_append_status_update_changeset(changeset_list, details, changeset_name, details_field, entity_id):
+              if details.get(details_field):
+                  changeset_list.append({
+                      'ChangeType': changeset_name,
+                      'Details': json.dumps({
+                          'Status': details[details_field],
+                      }),
+                      'Entity': {
+                          'Type': 'Experience@1.0',
+                          'Identifier': entity_id
+                      },
+                      'ChangeName': changeset_name + 'Change'
+                  })
+          
+          def build_and_append_requests_update_changeset(changeset_list, details, changeset_name, details_field, entity_id):
+              if details.get(details_field):
+                  changeset_list.append({
+                      'ChangeType': changeset_name,
+                      'Details': json.dumps({
+                          "Configuration":
+                          {
+                              "PolicyResourceRequests": details[details_field]
+                          }
+                      }),
+                      'Entity': {
+                          'Type': 'Experience@1.0',
+                          'Identifier': entity_id
+                      },
+                      'ChangeName': changeset_name + 'Change'
+                  })
+      Runtime: python3.9
+      Environment:
+        Variables:
+          PMP_S3_BUCKET: !Ref ExperiencesS3BucketName
+  S3BucketForPMPConfiguration:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ExperiencesS3BucketName
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: Experience_
+            Function: !GetAtt AsyncConfigurePrivateMarketplaceLambda.Arn   
+  S3LamdbaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - AsyncConfigurePrivateMarketplaceLambda
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${ExperiencesS3BucketName}

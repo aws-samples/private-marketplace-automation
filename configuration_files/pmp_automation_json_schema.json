@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-pmp-2024/schema#",
+  "type": "object",
+  "properties": {
+    "Name": {
+      "type": "string",
+      "description": "Experience name"
+    },
+    "AssociatePrincipals": {
+      "type": "array",
+      "items": [
+        {
+          "type": "string",
+          "description": "Principal to associate to an experience. Principals can be org-id, ou-id, or AWS account id."
+        }
+      ]
+    },
+    "DisassociatePrincipals": {
+      "type": "array",
+      "items": [
+        {
+          "type": "string",
+          "description": "Principal to disassociate from an experience. Principals can be org-id, ou-id, or AWS account id."
+        }
+      ]
+    },
+    "AllowProducts": {
+      "type": "array",
+      "items": [
+        {
+          "type": "string",
+          "description": "Product ids of AWS Marketplace products to allow for procurement."
+        }
+      ]
+    },
+    "DenyProducts": {
+      "type": "array",
+      "items": [
+        {
+          "type": "string",
+          "description": "Product ids of AWS Marketplace products to deny from procurement."
+        }
+      ]
+    },
+    "Status": { 
+      "enum": ["Enabled", "Disabled"],
+      "description": "Specify status of experience." 
+    },
+    "PolicyResourceRequests": { 
+      "enum": ["Allow", "Deny"],
+      "description": "Specify whether end users are allowed to make software requests."
+    }
+  }
+}

@@ -1,0 +1,147 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template when run in Management account will Enable private marketplace including creating service linked role and lambda function to enable service access for AWS Organization
+Parameters:
+  DelegatedAdministratorAccount: 
+    Type: String
+    Default: '000000000000'
+    Description: Account ID to register as delegated administrator for Private Marketplace. Default value 000000000000 will skip the registration.
+Resources:
+  PMPEnablementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lambda execution role for enabling Private Marketplace for AWS Organization
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - organizations:EnableAWSServiceAccess
+                  - organizations:RegisterDelegatedAdministrator
+                  - iam:CreateServiceLinkedRole
+                  - iam:GetRole
+                Effect: Allow
+                Resource: '*'
+            Version: '2012-10-17'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - PMPEnablementLambdaPolicy
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  PMPEnablementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 'PMPEnablementLambdaRole.Arn'
+      Timeout: 180
+      ReservedConcurrentExecutions: 3
+      Code:
+        ZipFile: |
+            import sys
+            import os
+            import json
+            import boto3
+            import time
+            import cfnresponse
+
+            PMP_SERVICE_PRINCIPAL = "private-marketplace.marketplace.amazonaws.com"
+            PMP_SERVICE_LINKED_ROLE_NAME = "AWSServiceRoleForPrivateMarketplaceAdmin"
+            PMP_ENABLEMENT_ROLE_KEY = "PrivateMarketplaceEnablementRole"
+            PMP_DELEGATED_ADMIN = os.environ['PMP_DELEGATED_ADMIN']
+            SKIP_DELEGATED_ADMIN_REGISTRATION_VALUE = '000000000000'
+
+            iam_client = boto3.client('iam')
+            orgs_client = boto3.client('organizations')
+
+            def lambda_handler(event, context):
+                print("Entering PMP enablement lambda handler")
+
+                # First, create SLR
+                create_service_linked_role(iam_client)
+                # Then, enable trusted access for AWS Organizations
+                enable_aws_service_access(orgs_client)
+                register_delegated_administrator(orgs_client, PMP_DELEGATED_ADMIN)
+    
+                print('Successfully enabled Private Marketplace in the organization.')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={})
+
+            def create_service_linked_role(iam_client):
+                # Call IAM to create SLR
+                try:
+                    iam_client.create_service_linked_role(AWSServiceName=PMP_SERVICE_PRINCIPAL)
+                except iam_client.exceptions.InvalidInputException:
+                    print('SLR already exists')
+                    return True    
+
+                slr_created = False
+                attempts = 0
+                while attempts < 5  and not slr_created:
+                    print('Waiting for SLR creation to complete')
+                    time.sleep(10)
+                    attempts += 1
+                    slr_created = check_service_linked_role(iam_client)
+
+                if not slr_created:
+                    print("ERROR: Failed to create SLR")
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData={})
+                    sys.exit(1)
+
+            def check_service_linked_role(iam_client):
+                try:
+                    response = iam_client.get_role(RoleName=PMP_SERVICE_LINKED_ROLE_NAME)   
+                    print("SLR created")
+                    return True
+                except iam_client.exceptions.NoSuchEntityException:
+                    return False
+    
+            def enable_aws_service_access(orgs_client): 
+                print('Enabling service access for Private Marketplace ...')
+                orgs_client.enable_aws_service_access(ServicePrincipal=PMP_SERVICE_PRINCIPAL)
+                print("Wait for enable service access action to propagate to Private Marketplace ...")
+                time.sleep(60)
+
+            def register_delegated_administrator(orgs_client, delegated_admin_account_id):
+                if PMP_DELEGATED_ADMIN == SKIP_DELEGATED_ADMIN_REGISTRATION_VALUE:
+                  print("Skipping delegated administrator registration as no valid account id has been provided.")
+                  return
+
+                print("Registering account", delegated_admin_account_id, "as delegated administrator for Private Marketplace ...")
+                try:
+                    orgs_client.register_delegated_administrator(
+                        AccountId=delegated_admin_account_id,
+                        ServicePrincipal=PMP_SERVICE_PRINCIPAL
+                    )
+                except orgs_client.exceptions.AccountAlreadyRegisteredException:
+                    print("Account", delegated_admin_account_id, "is already registered as delegated administrator for Private Marketplace")
+      Runtime: python3.9
+      Environment:
+        Variables:
+          PMP_DELEGATED_ADMIN: !Ref DelegatedAdministratorAccount
+  PMPEnablementCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'PMPEnablementLambda.Arn'

@@ -1,0 +1,210 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  This template listens to event bridge changeset notifications and 
+  updates S3 with the status of the changeset.  
+Parameters:
+  ExperiencesS3BucketName: 
+    Type: String
+    Description: Amazon S3 bucket that holds the configuration and status for AWS private marketplace experiences
+Resources:
+  EventRule0:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Updating S3 with changeset status 
+      EventPattern:
+        source:
+          - aws.marketplacecatalog
+        detail-type:
+          - Change Set Succeeded
+          - Change Set Failed
+          - Change Set Cancelled
+      Name: !Join
+          - '-'
+          - - !Ref 'AWS::StackName'
+            - pmp-configuration-status
+      State: ENABLED
+      Targets:
+        - Id: ChangesetStatusUpdate
+          Arn: !GetAtt 'ChangesetStatusUpdateLambda.Arn'
+    DependsOn:
+      - ChangesetStatusUpdateLambda
+  ChangesetStatusUpdateLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      FunctionName: !GetAtt ChangesetStatusUpdateLambda.Arn
+  ChangesetStatusUpdateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lambda execution role updating experience creation status to Amazon S3
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                  - S3:GetObject
+                  - S3:PutObject
+                  - S3:ListObjects
+                Effect: Allow
+                Resource:
+                    - !Sub arn:aws:s3:::${ExperiencesS3BucketName}
+                    - !Sub arn:aws:s3:::${ExperiencesS3BucketName}/*
+            Version: '2012-10-17'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - StatusUpdateS3LambdaPolicy
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - aws-marketplace:DescribeChangeSet
+                Effect: Allow
+                Resource: '*'
+            Version: '2012-10-17'
+          PolicyName: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - StatusUpdatePMPLambdaPolicy
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  ChangesetStatusUpdateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 'ChangesetStatusUpdateLambdaRole.Arn'
+      Timeout: 900
+      ReservedConcurrentExecutions: 3
+      Code:
+        ZipFile: |
+          import sys
+          import os
+          import time
+          import json
+          import boto3
+          
+          PMP_S3_BUCKET = os.environ['PMP_S3_BUCKET']
+          PMP_STATUS_FILE_PREFIX = 'STATUS_'
+          PMP_ERROR_FILE_PREFIX = 'ERROR_'
+          CHANGESET_ID= 'ChangeSetId'
+          CHANGESET_STATUS = 'ChangeSetStatus'
+          CHANGESET_IN_PROGRESS = 'In Progress'
+          CHANGESET_SUCCESSFUL = 'Successful'
+          CHANGESET_FAILED = 'Failed'
+          ERROR_MESSAGE = 'Error Message'
+          EXPERIENCE_ID = "Experience Id"
+          MARKETPLACE_CATALOG = 'AWSMarketplace'
+          
+          EVENT_SUCCESS = "Change Set Succeeded"
+          EVENT_FAILED = "Change Set Failed"
+          EVENT_CANCELLED = "Change Set Cancelled"
+
+          s3_client = boto3.client('s3')
+          mp_client = boto3.client('marketplace-catalog')
+
+          def lambda_handler(event, context):
+              try:
+                  print("ChangeSet Status Update Lambda starts. Event is :", event)
+        
+                  # Get all status files in S3 bucket. 
+                  for s3_contents in s3_client.list_objects(Bucket=PMP_S3_BUCKET, Prefix=PMP_STATUS_FILE_PREFIX)['Contents']:
+                      status_content = s3_client.get_object(
+                        Bucket = PMP_S3_BUCKET,
+                        Key = s3_contents['Key'])['Body'].read()
+                      details = json.loads(status_content)
+                      print('Details:', details)
+          
+                      changeset_id = event['detail']['ChangeSetId']
+                      if CHANGESET_ID in details and details[CHANGESET_ID] == changeset_id:
+                          write_status_to_s3(event, changeset_id, details, s3_contents)
+              except Exception as e:
+                  print("Lambda failed with an exception", e)  
+          
+          def write_status_to_s3(event, changeset_id, details, s3_file):
+              print("Checking if updates are required for status file", s3_file['Key'])   
+    
+              print("Event detail-type: ", event['detail-type'])
+    
+              # Update Changeset status in the status file in S3 bucket
+              changeset_status = ''
+              changeset_status_update = ''
+              error_detaillist = ''
+              if event['detail-type'] == EVENT_SUCCESS:
+                  changeset_status = CHANGESET_SUCCESSFUL
+                  # If the lambda is invoked for creation, experience id will not be in status file. Update experience ID 
+                  if not EXPERIENCE_ID in details:
+                      changeset_details = get_change_set_details(changeset_id)
+                      experience_id_with_version = changeset_details['ChangeSet'][0]['Entity']['Identifier']
+                      experience_id = experience_id_with_version.split('@')[0]    
+                      experience_id_update = {EXPERIENCE_ID: experience_id}
+                      details.update(experience_id_update)
+              elif event['detail-type'] == EVENT_FAILED or event['detail-type'] == EVENT_CANCELLED:
+                      changeset_status = CHANGESET_FAILED
+                      changeset_details = get_change_set_details(changeset_id)
+                      # Get error message to update in status file
+                      for changeset in changeset_details['ChangeSet']:
+                          error_detaillist = changeset['ErrorDetailList']
+                          if error_detaillist:
+                              error_message = changeset['ErrorDetailList'][0]['ErrorMessage']
+                              print('Error message:', error_message)
+                              error_message_update = {ERROR_MESSAGE: error_message }
+                              details.update(error_message_update)
+              else:
+                  print("Unhandled event", event['detail-type'])
+                  return
+                  
+              # Update status file    
+              if changeset_status:    
+                  print("Updating status of changeset to " + changeset_status)
+                  changeset_status_update = {CHANGESET_STATUS: changeset_status}
+                  details.update(changeset_status_update)
+                  s3_client.put_object(Bucket = PMP_S3_BUCKET,
+                                  Key = s3_file['Key'],
+                                  Body = json.dumps(details).encode()
+                                )
+
+              # For auditability, write to an error file with current timestamp appended to the name. Status file gets over-written
+              if changeset_status == CHANGESET_FAILED:
+                  error_file_name = PMP_ERROR_FILE_PREFIX + s3_file['Key'] + "_" + time.strftime("%Y%m%d-%H%M%S")  
+                  print("Writing error to file " + error_file_name) 
+                  s3_client.put_object(Bucket = PMP_S3_BUCKET,
+                                  Key = error_file_name,
+                                  Body = json.dumps(changeset_details).encode()
+                                )
+          
+          def get_change_set_details(changeset_id):
+              changeset_details = mp_client.describe_change_set(
+                                  Catalog = MARKETPLACE_CATALOG,
+                                  ChangeSetId = changeset_id)
+    
+              print('Changeset Details:', changeset_details)  
+              return changeset_details
+      Runtime: python3.9
+      Environment:
+        Variables:
+          PMP_S3_BUCKET: !Ref ExperiencesS3BucketName

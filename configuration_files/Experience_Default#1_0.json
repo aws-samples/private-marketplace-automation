@@ -1,0 +1,15 @@
+{
+    "Name": "Default Experience",
+    "AssociatePrincipals": [
+        "o-abcdef1234"
+    ],
+    "AllowProducts":[
+        "12345678-0123-4567-abcd-43176543210",
+        "12345678-0123-4567-abcd-43176543211"
+    ],
+    "DenyProducts":[
+        "12345678-0123-4567-abcd-43176543212"
+    ],
+    "Status": "Enabled",
+    "PolicyResourceRequests": "Deny"
+}
